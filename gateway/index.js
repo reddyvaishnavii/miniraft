@@ -83,11 +83,13 @@ function broadcast(msg) {
 }
 
 // ─── Forward stroke to leader with retry / failover ──────────────────────────
-async function forwardStrokeToLeader(stroke, retries = 3) {
+
+async function forwardStrokeToLeader(stroke, requestId, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
     if (!currentLeader) {
       currentLeader = await discoverLeader();
     }
+
     if (!currentLeader) {
       logInfo("No leader available — waiting...");
       await new Promise((r) => setTimeout(r, 300));
@@ -97,31 +99,70 @@ async function forwardStrokeToLeader(stroke, retries = 3) {
     try {
       const res = await axios.post(
         `${currentLeader}/stroke`,
-        { stroke },
+        { stroke, requestId },
         { timeout: 1000 }
       );
+
       if (res.data.ok) {
-        logInfo(`Stroke committed at index ${res.data.index}`);
-        // Broadcast the committed stroke to all clients
-        broadcast({ type: "stroke", stroke });
+        logInfo(`Stroke ${requestId} committed at index ${res.data.index}`);
+        broadcast({ type: "stroke", stroke, requestId });
         return;
       }
     } catch (err) {
       if (err.response?.status === 307) {
-        // Replica redirected us — it knows who the leader is
         const hint = err.response.data?.leaderId;
         logInfo(`Redirected to leader hint: ${hint}`);
-        // Find the matching replica URL
         currentLeader =
           REPLICAS.find((r) => r.includes(hint?.split(":")[0])) || null;
       } else {
-        logInfo(`Leader ${currentLeader} unreachable — re-discovering...`);
+        logInfo(`Leader ${currentLeader} unreachable or request failed — re-discovering...`);
         currentLeader = null;
       }
     }
   }
-  logInfo("Failed to forward stroke after retries");
+
+  logInfo(`Failed to forward stroke ${requestId} after retries`);
 }
+
+
+async function forwardClearToLeader(requestId, retries = 3) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (!currentLeader) {
+      currentLeader = await discoverLeader();
+    }
+
+    if (!currentLeader) {
+      await new Promise((r) => setTimeout(r, 300));
+      continue;
+    }
+
+    try {
+      const res = await axios.post(
+        `${currentLeader}/clear`,
+        { requestId },
+        { timeout: 1000 }
+      );
+
+      if (res.data.ok) {
+        logInfo(`Clear committed at index ${res.data.index}`);
+        broadcast({ type: "clear", requestId });
+        return;
+      }
+    } catch (err) {
+      if (err.response?.status === 307) {
+        const hint = err.response.data?.leaderId;
+        currentLeader =
+          REPLICAS.find((r) => r.includes(hint?.split(":")[0])) || null;
+      } else {
+        logInfo(`Clear request failed at ${currentLeader}; rediscovering leader`);
+        currentLeader = null;
+      }
+    }
+  }
+
+  logInfo(`Failed to forward Clear request ${requestId} after retries`);
+}
+
 
 // ─── WebSocket Connection Handler ─────────────────────────────────────────────
 wss.on("connection", async (ws) => {
@@ -134,10 +175,24 @@ wss.on("connection", async (ws) => {
     if (leader) {
       const res = await axios.get(`${leader}/log`, { timeout: 500 });
       const entries = res.data.entries || [];
-      for (const entry of entries) {
-        ws.send(JSON.stringify({ type: "stroke", stroke: entry.stroke }));
-      }
-      logInfo(`Sent ${entries.length} historical strokes to new client`);
+
+for (const entry of entries) {
+  if (entry.type === "clear") {
+    ws.send(JSON.stringify({
+      type: "clear",
+      requestId: entry.requestId
+    }));
+  } else if (entry.stroke) {
+    ws.send(JSON.stringify({
+      type: "stroke",
+      stroke: entry.stroke,
+      requestId: entry.requestId
+    }));
+  }
+}
+
+logInfo(`Replayed ${entries.length} historical log entries to new client`);
+
     }
   } catch {
     logInfo("Could not fetch log for new client");
@@ -152,7 +207,11 @@ wss.on("connection", async (ws) => {
     }
 
     if (msg.type === "stroke") {
-      await forwardStrokeToLeader(msg.stroke);
+      const requestId = msg.requestId || require("crypto").randomUUID();
+      await forwardStrokeToLeader(msg.stroke, requestId);
+    } else if (msg.type === "clear") {
+      const requestId = msg.requestId || require("crypto").randomUUID();
+      await forwardClearToLeader(requestId);
     }
   });
 

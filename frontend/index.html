@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RaftBoard — Distributed Drawing</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
     /* ── Reset & Variables ─────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -23,7 +24,6 @@
       --font-mono: 'JetBrains Mono', monospace;
     }
 
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
 
     html, body {
       height: 100%;
@@ -350,10 +350,15 @@ document.querySelectorAll(".size-btn").forEach((el) => {
 });
 
 document.getElementById("clearBtn").addEventListener("click", () => {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  totalStrokes = 0;
-  document.getElementById("stroke-count").textContent = 0;
-  showToast("Canvas cleared (local only)");
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "clear",
+      requestId: crypto.randomUUID()
+    }));
+    showToast("Clear request sent…");
+  } else {
+    showToast("Not connected — clear was not sent");
+  }
 });
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -372,13 +377,19 @@ function connect() {
   };
 
   ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === "stroke") {
-      drawPath(msg.stroke.points, msg.stroke.color, msg.stroke.size);
-      totalStrokes++;
-      document.getElementById("stroke-count").textContent = totalStrokes;
-    }
-  };
+  const msg = JSON.parse(evt.data);
+
+  if (msg.type === "stroke") {
+    drawPath(msg.stroke.points, msg.stroke.color, msg.stroke.size);
+    totalStrokes++;
+    document.getElementById("stroke-count").textContent = totalStrokes;
+  } else if (msg.type === "clear") {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    totalStrokes = 0;
+    document.getElementById("stroke-count").textContent = 0;
+    showToast("Canvas cleared");
+  }
+};
 
   ws.onclose = () => {
     document.getElementById("ws-status").classList.remove("connected");
