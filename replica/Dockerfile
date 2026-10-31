@@ -8,5 +8,6 @@ RUN npm install --omit=dev
 
 COPY index.js ./
 COPY log-reconciliation.js ./
+COPY replication.js ./
 
 CMD ["node", "index.js"]

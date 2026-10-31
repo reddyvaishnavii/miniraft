@@ -13,6 +13,7 @@ const PORT = Number.parseInt(process.env.REPLICA_PORT || "4001", 10);
 const PEERS = (process.env.PEERS || "").split(",").map(s => s.trim()).filter(Boolean);
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const STATE_FILE = path.join(DATA_DIR, "raft-state.json");
+const { replicateBatches } = require("./replication");
 
 const HEARTBEAT_INTERVAL_MS = 150;
 const ELECTION_TIMEOUT_MIN = 500;
@@ -79,7 +80,6 @@ function resetElectionTimer() {
   electionTimer = setTimeout(() => startElection(), randomElectionTimeout());
 }
 
-
 function becomeFollower(term, newLeader = null, resetTimer = true) {
   const termChanged = term > currentTerm;
   const leadershipChanged =
@@ -104,7 +104,6 @@ function becomeFollower(term, newLeader = null, resetTimer = true) {
     logInfo(`Became FOLLOWER${newLeader ? `; leader=${newLeader}` : ""}`);
   }
 }
-
 
 function lastLogIndex() {
   return log.length - 1;
@@ -159,7 +158,6 @@ async function startElection() {
   }
 }
 
-
 function becomeLeader() {
   state = "LEADER";
   leaderId = REPLICA_ID;
@@ -184,7 +182,6 @@ function becomeLeader() {
   replicateAllPeers().catch(() => {});
 }
 
-
 function higherTermResponse(response) {
   if (response && Number.isInteger(response.term) && response.term > currentTerm) {
     becomeFollower(response.term);
@@ -197,45 +194,31 @@ function higherTermResponse(response) {
  * Send AppendEntries (including empty heartbeats) to a peer.
  * On log mismatch, back up nextIndex and retry. Entries are sent as a suffix.
  */
+
 async function replicatePeer(peer) {
-  if (state !== "LEADER") return false;
-  let nextIndex = peerNextIndex.get(peer) ?? log.length;
+  return replicateBatches({
+    getLog: () => log,
+    getTerm: () => currentTerm,
+    getLeaderId: () => REPLICA_ID,
+    getCommitIndex: () => commitIndex,
+    getState: () => state,
+    peer,
+    peerNextIndex,
+    peerMatchIndex,
+    sendAppendEntries: async (targetPeer, payload) => {
+      const response = await axios.post(
+        `${targetPeer}/append-entries`,
+        payload,
+        { timeout: RPC_TIMEOUT_MS }
+      );
 
-  for (let attempt = 0; attempt < Math.max(3, log.length + 2); attempt++) {
-    if (state !== "LEADER") return false;
-    nextIndex = Math.max(0, Math.min(nextIndex, log.length));
-    const prevLogIndex = nextIndex - 1;
-    const prevLogTerm = prevLogIndex >= 0 ? log[prevLogIndex].term : -1;
-    const entries = log.slice(nextIndex, nextIndex + 50);
-
-    try {
-      const response = await axios.post(`${peer}/append-entries`, {
-        term: currentTerm,
-        leaderId: REPLICA_ID,
-        prevLogIndex,
-        prevLogTerm,
-        entries,
-        leaderCommit: commitIndex
-      }, { timeout: RPC_TIMEOUT_MS });
-
-      if (higherTermResponse(response.data)) return false;
-
-      if (response.data.success) {
-        const matchIndex = prevLogIndex + entries.length;
-        peerNextIndex.set(peer, matchIndex + 1);
-        peerMatchIndex.set(peer, matchIndex);
-        return true;
+      if (higherTermResponse(response.data)) {
+        return { ...response.data, higherTerm: true };
       }
 
-      // A stale-term response or missing/conflicting previous entry: retry earlier.
-      nextIndex = Math.max(0, Math.min(nextIndex - 1, Number.isInteger(response.data.conflictIndex)
-        ? response.data.conflictIndex : nextIndex - 1));
-      peerNextIndex.set(peer, nextIndex);
-    } catch {
-      return false;
-    }
-  }
-  return false;
+      return response.data;
+    },
+  });
 }
 
 async function replicateAllPeers() {
@@ -261,8 +244,6 @@ function advanceCommitIndex() {
     }
   }
 }
-
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function startHeartbeat() {
   stopHeartbeat();
@@ -328,7 +309,6 @@ app.post("/append-entries", (req, res) => {
     }
   }
 
-  
   const result = reconcileLog({
     log,
     commitIndex,
@@ -356,9 +336,6 @@ app.post("/append-entries", (req, res) => {
   persistState();
   return res.json({ term: currentTerm, success: true, logLength: log.length });
 });
-
-
-
 
 const inFlightStrokes = new Map();
 const inFlightClears = new Map();
@@ -470,8 +447,6 @@ app.post("/stroke", async (req, res) => {
   }
 });
 
-
-
 app.post("/clear", async (req, res) => {
   if (state !== "LEADER") {
     return res.status(307).json({
@@ -579,11 +554,6 @@ app.post("/clear", async (req, res) => {
     inFlightClears.delete(requestId);
   }
 });
-
-
-
-
-
 
 app.get("/status", (req, res) => {
   res.json({ replicaId: REPLICA_ID, state, currentTerm, leaderId, logLength: log.length, commitIndex });
