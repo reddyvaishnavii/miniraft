@@ -41,21 +41,34 @@ function logInfo(msg) {
  * Poll all replicas and return the URL of whichever one claims to be LEADER.
  * If none found, returns null.
  */
+
 async function discoverLeader() {
-  for (const replicaUrl of REPLICAS) {
-    try {
-      const res = await axios.get(`${replicaUrl}/status`, {
-        timeout: LEADER_TIMEOUT,
-      });
-      if (res.data.state === "LEADER") {
-        return replicaUrl;
+  const results = await Promise.all(
+    REPLICAS.map(async (url) => {
+      try {
+        const res = await axios.get(`${url}/status`, {
+          timeout: LEADER_TIMEOUT,
+        });
+        return { url, ...res.data };
+      } catch {
+        // Replica is unreachable.
+        return null;
       }
-    } catch {
-      /* replica unreachable */
-    }
-  }
-  return null;
+    })
+  );
+
+  const leaders = results.filter(
+    (result) => result && result.state === "LEADER"
+  );
+
+  if (leaders.length === 0) return null;
+
+  leaders.sort(
+    (a, b) => (b.currentTerm ?? -1) - (a.currentTerm ?? -1)
+  );
+  return leaders[0].url;
 }
+
 
 /** Keep currentLeader fresh on a background interval */
 async function pollLeader() {

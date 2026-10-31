@@ -80,7 +80,7 @@ function resetElectionTimer() {
 }
 
 
-function becomeFollower(term, newLeader = null) {
+function becomeFollower(term, newLeader = null, resetTimer = true) {
   const termChanged = term > currentTerm;
   const leadershipChanged =
     state !== "FOLLOWER" ||
@@ -96,7 +96,9 @@ function becomeFollower(term, newLeader = null) {
   state = "FOLLOWER";
   leaderId = newLeader;
   stopHeartbeat();
-  resetElectionTimer();
+  if (resetTimer) {
+    resetElectionTimer();
+  }
 
   if (leadershipChanged) {
     logInfo(`Became FOLLOWER${newLeader ? `; leader=${newLeader}` : ""}`);
@@ -157,17 +159,31 @@ async function startElection() {
   }
 }
 
+
 function becomeLeader() {
   state = "LEADER";
   leaderId = REPLICA_ID;
   stopElectionTimer();
+
   peerNextIndex = new Map(PEERS.map(peer => [peer, log.length]));
   peerMatchIndex = new Map(PEERS.map(peer => [peer, -1]));
+
+  // Append a no-op entry to establish commitment in the current term.
+  log.push({
+    index: log.length,
+    term: currentTerm,
+    requestId: `noop-${REPLICA_ID}-${currentTerm}`,
+    type: "noop",
+  });
+  persistState();
+
   logInfo("Became LEADER");
   startHeartbeat();
-  // Immediately announce leadership and try to catch followers up.
+
+  // Immediately announce leadership and catch followers up.
   replicateAllPeers().catch(() => {});
 }
+
 
 function higherTermResponse(response) {
   if (response && Number.isInteger(response.term) && response.term > currentTerm) {
@@ -190,7 +206,7 @@ async function replicatePeer(peer) {
     nextIndex = Math.max(0, Math.min(nextIndex, log.length));
     const prevLogIndex = nextIndex - 1;
     const prevLogTerm = prevLogIndex >= 0 ? log[prevLogIndex].term : -1;
-    const entries = log.slice(nextIndex);
+    const entries = log.slice(nextIndex, nextIndex + 50);
 
     try {
       const response = await axios.post(`${peer}/append-entries`, {
@@ -265,8 +281,12 @@ app.post("/request-vote", (req, res) => {
   if (!Number.isInteger(term) || typeof candidateId !== "string") {
     return res.status(400).json({ term: currentTerm, voteGranted: false, error: "invalid-request" });
   }
-  if (term < currentTerm) return res.json({ term: currentTerm, voteGranted: false });
-  if (term > currentTerm) becomeFollower(term);
+  if (term < currentTerm) {
+    return res.json({ term: currentTerm, voteGranted: false });
+  }
+  if (term > currentTerm) {
+    becomeFollower(term, null, false);
+  }
 
   const logIsUpToDate =
     candidateTerm > lastLogTerm() ||
@@ -327,10 +347,12 @@ app.post("/append-entries", (req, res) => {
 
   log = result.log;
 
+  const lastNewIndex = prevLogIndex + entries.length;
 
   if (leaderCommit > commitIndex) {
-    commitIndex = Math.min(leaderCommit, log.length - 1);
+    commitIndex = Math.min(leaderCommit, lastNewIndex);
   }
+
   persistState();
   return res.json({ term: currentTerm, success: true, logLength: log.length });
 });
@@ -410,7 +432,10 @@ app.post("/stroke", async (req, res) => {
 
     advanceCommitIndex();
 
-    if (commitIndex >= entry.index) {
+    if (
+      commitIndex >= entry.index &&
+      log[entry.index]?.requestId === requestId
+    ) {
       await replicateAllPeers();
       return {
         status: 200,
@@ -515,7 +540,10 @@ app.post("/clear", async (req, res) => {
 
     advanceCommitIndex();
 
-    if (commitIndex >= entry.index) {
+    if (
+      commitIndex >= entry.index &&
+      log[entry.index]?.requestId === requestId
+    ) {
       await replicateAllPeers();
 
       return {
@@ -554,10 +582,6 @@ app.post("/clear", async (req, res) => {
 
 
 
-app.post("/sync-log", (req, res) => {
-  const fromIndex = Math.max(0, Number.parseInt(req.body?.fromIndex ?? "0", 10));
-  res.json({ entries: log.slice(fromIndex).filter(e => e.index <= commitIndex), commitIndex });
-});
 
 
 
